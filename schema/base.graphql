@@ -1,0 +1,37 @@
+# ============================================================
+# Base Schema
+# ============================================================
+#
+# The minimum required for features to use `extend type`.
+#
+# graph-gophers/graphql-go requires at least one field per type,
+# so each type has a health-check field.
+#
+# Features extend these types:
+#
+#   extend type Query { myQuery: ... }
+#   extend type Mutation { myMutation: ... }
+#   extend type Subscription { myEvent: ... }
+#
+# ============================================================
+
+"""
+API version. Useful as a health check for the GraphQL endpoint.
+"""
+type Query {
+    version: String!
+}
+
+"""
+Internal placeholder mutation. Not intended for client use.
+"""
+type Mutation {
+    noopMutation: Boolean
+}
+
+"""
+Internal placeholder subscription. Not intended for client use.
+"""
+type Subscription {
+    noopSubscription: Boolean
+}

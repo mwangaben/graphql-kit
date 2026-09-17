@@ -1,0 +1,15 @@
+# Go
+*.test
+*.out
+coverage.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Fuzz cache (but keep corpus)
+**/testdata/fuzz/**/cache/
