@@ -1,6 +1,32 @@
 # Changelog
+## [v0.0.2] - 2026-09-19
 
-## [0.1.0] - 2026-09-17
+### Added
+- **WebSocket authentication** — private subscriptions can now require auth
+- `Authenticator` interface — pluggable token validation
+- `AuthenticatorFunc` — function adapter
+- `WithAuthenticator` — configure WS auth
+- `WithUserFunc` — inject authenticated user into context
+- `WithAllowedOrigins` — restrict WebSocket origins
+- Token extraction from `connection_init` payload (protocol-standard)
+- Token extraction from `?token=` query parameter (convenient for dev)
+
+### Design
+- Auth is optional. Unauthenticated connections are allowed;
+  private subscriptions fail with `Unauthenticated`.
+- Public subscriptions work without auth.
+- The kit is auth-agnostic — apps provide their own Authenticator.
+
+### Compatible With
+- `graphql-ws` protocol (as used by Apollo, graph-gophers, etc.)
+- Works with any JWT / token mechanism
+
+
+
+
+
+
+## [v0.0.1] - 2026-09-17
 
 ### Added
 - `schema.Builder` — Compose GraphQL schemas from feature fragments
