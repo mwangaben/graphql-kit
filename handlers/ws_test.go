@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,15 +18,48 @@ import (
 // Subscription test fixtures
 // ============================================================================
 
+// subResolver delivers each published Tick to every active subscription.
+//
+// Each Tick() call returns a fresh channel, buffered large enough that a
+// batch of publishes never blocks an active subscriber. publish() blocks
+// until every subscriber has accepted the event (or the test deadline
+// expires), so tests never silently drop events due to timing.
 type subResolver struct {
-	events chan *Tick
+	mu   sync.Mutex
+	subs []chan *Tick
+}
+
+// publish delivers t to every currently active subscriber.
+//
+// It blocks until each subscriber has received the event, or the test
+// deadline (10s) expires — in which case it calls t.Fatalf. This mirrors
+// a real broker that backs-pressure the publisher rather than dropping
+// silently, and it removes the race between "subscriber registered in
+// subs" and "graph-gophers is actually reading from its channel".
+func (r *subResolver) publish(t *testing.T, ev *Tick) {
+	t.Helper()
+	r.mu.Lock()
+	subs := append([]chan *Tick(nil), r.subs...)
+	r.mu.Unlock()
+
+	deadline := time.After(10 * time.Second)
+	for _, ch := range subs {
+		select {
+		case ch <- ev:
+		case <-deadline:
+			t.Fatalf("publish timed out: a subscriber is not draining its channel")
+		}
+	}
+}
+
+// subscriberCount returns the number of registered subscriptions.
+func (r *subResolver) subscriberCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.subs)
 }
 
 // Tick is the payload for the tick subscription.
-//
-// Struct fields and methods both named ID would conflict in Go,
-// so the value field has a suffix. The ID() method satisfies
-// graph-gophers' field resolver requirement for `id`.
 type Tick struct {
 	IDValue int32
 }
@@ -42,9 +76,35 @@ func (r *subResolver) NoopSubscription() <-chan *bool {
 	return ch
 }
 
-// Tick subscribes to tick events.
+// Tick subscribes to tick events. Each call gets its own channel, buffered
+// to comfortably hold the largest batch any test publishes (n = 100).
 func (r *subResolver) Tick(ctx context.Context) <-chan *Tick {
-	return r.events
+	ch := make(chan *Tick, 256)
+	r.mu.Lock()
+	r.subs = append(r.subs, ch)
+	r.mu.Unlock()
+	return ch
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+// waitForSubscribers polls res until at least n subscriptions are registered,
+// or fails the test after a short deadline. Replaces fragile fixed sleeps.
+func waitForSubscribers(t *testing.T, res *subResolver, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if res.subscriberCount() >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d subscriber(s), have %d",
+				n, res.subscriberCount())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 const subSDL = `
@@ -69,15 +129,11 @@ type Subscription {
 // ============================================================================
 
 func TestWS_ConnectionInit(t *testing.T) {
-	events := make(chan *Tick, 10)
-	defer close(events)
-
-	parsed := graphql.MustParseSchema(subSDL, &subResolver{events: events})
+	parsed := graphql.MustParseSchema(subSDL, &subResolver{})
 
 	server := httptest.NewServer(handlers.NewWebSocket(parsed))
 	defer server.Close()
 
-	// Connect
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
@@ -85,13 +141,11 @@ func TestWS_ConnectionInit(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Send connection_init
 	init, _ := json.Marshal(map[string]string{"type": "connection_init"})
 	if err := conn.WriteMessage(websocket.TextMessage, init); err != nil {
 		t.Fatalf("write init: %v", err)
 	}
 
-	// Expect connection_ack
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
@@ -112,10 +166,8 @@ func TestWS_ConnectionInit(t *testing.T) {
 // ============================================================================
 
 func TestWS_SubscriptionFlow(t *testing.T) {
-	events := make(chan *Tick, 10)
-	defer close(events)
-
-	parsed := graphql.MustParseSchema(subSDL, &subResolver{events: events})
+	res := &subResolver{}
+	parsed := graphql.MustParseSchema(subSDL, res)
 
 	server := httptest.NewServer(handlers.NewWebSocket(parsed))
 	defer server.Close()
@@ -127,14 +179,12 @@ func TestWS_SubscriptionFlow(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// 1. Init
 	init, _ := json.Marshal(map[string]string{"type": "connection_init"})
 	_ = conn.WriteMessage(websocket.TextMessage, init)
 
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	_, _, _ = conn.ReadMessage() // ack
 
-	// 2. Start subscription
 	startPayload, _ := json.Marshal(map[string]interface{}{
 		"query":     "subscription { tick { id } }",
 		"variables": nil,
@@ -146,11 +196,10 @@ func TestWS_SubscriptionFlow(t *testing.T) {
 	})
 	_ = conn.WriteMessage(websocket.TextMessage, start)
 
-	// 3. Publish an event
-	time.Sleep(100 * time.Millisecond) // let subscription register
-	events <- &Tick{IDValue: 42}
+	// Wait until the resolver has registered the subscription, then publish.
+	waitForSubscribers(t, res, 1)
+	res.publish(t, &Tick{IDValue: 42})
 
-	// 4. Expect data message
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
@@ -175,10 +224,8 @@ func TestWS_SubscriptionFlow(t *testing.T) {
 // ============================================================================
 
 func TestWS_StopSubscription(t *testing.T) {
-	events := make(chan *Tick, 10)
-	defer close(events)
-
-	parsed := graphql.MustParseSchema(subSDL, &subResolver{events: events})
+	res := &subResolver{}
+	parsed := graphql.MustParseSchema(subSDL, res)
 
 	server := httptest.NewServer(handlers.NewWebSocket(parsed))
 	defer server.Close()
@@ -190,7 +237,6 @@ func TestWS_StopSubscription(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Init + start
 	init, _ := json.Marshal(map[string]string{"type": "connection_init"})
 	_ = conn.WriteMessage(websocket.TextMessage, init)
 
@@ -207,16 +253,16 @@ func TestWS_StopSubscription(t *testing.T) {
 	})
 	_ = conn.WriteMessage(websocket.TextMessage, start)
 
-	// Stop it
+	waitForSubscribers(t, res, 1)
+
 	stop, _ := json.Marshal(map[string]string{"id": "1", "type": "stop"})
 	_ = conn.WriteMessage(websocket.TextMessage, stop)
 
 	time.Sleep(100 * time.Millisecond)
 
-	// Publish — should not arrive
-	events <- &Tick{IDValue: 99}
+	// Publish — should not arrive because the subscription was stopped.
+	res.publish(t, &Tick{IDValue: 99})
 
-	// Expect timeout (no data message)
 	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	_, _, err = conn.ReadMessage()
 	if err == nil {
@@ -229,10 +275,8 @@ func TestWS_StopSubscription(t *testing.T) {
 // ============================================================================
 
 func TestWS_ConnectionTerminate(t *testing.T) {
-	events := make(chan *Tick, 10)
-	defer close(events)
-
-	parsed := graphql.MustParseSchema(subSDL, &subResolver{events: events})
+	res := &subResolver{}
+	parsed := graphql.MustParseSchema(subSDL, res)
 
 	server := httptest.NewServer(handlers.NewWebSocket(parsed))
 	defer server.Close()
@@ -244,11 +288,9 @@ func TestWS_ConnectionTerminate(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Send terminate — server should close cleanly
 	msg, _ := json.Marshal(map[string]string{"type": "connection_terminate"})
 	_ = conn.WriteMessage(websocket.TextMessage, msg)
 
-	// Next read should error (server closed)
 	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 	_, _, err = conn.ReadMessage()
 	if err == nil {
@@ -261,10 +303,8 @@ func TestWS_ConnectionTerminate(t *testing.T) {
 // ============================================================================
 
 func TestWS_MalformedMessages(t *testing.T) {
-	events := make(chan *Tick, 10)
-	defer close(events)
-
-	parsed := graphql.MustParseSchema(subSDL, &subResolver{events: events})
+	res := &subResolver{}
+	parsed := graphql.MustParseSchema(subSDL, res)
 
 	server := httptest.NewServer(handlers.NewWebSocket(parsed))
 	defer server.Close()
@@ -276,12 +316,10 @@ func TestWS_MalformedMessages(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Send garbage
 	_ = conn.WriteMessage(websocket.TextMessage, []byte("not json"))
 	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type": "unknown"}`))
 	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{}`))
 
-	// Server should still respond to valid init
 	init, _ := json.Marshal(map[string]string{"type": "connection_init"})
 	_ = conn.WriteMessage(websocket.TextMessage, init)
 
@@ -303,10 +341,8 @@ func TestWS_MalformedMessages(t *testing.T) {
 // ============================================================================
 
 func TestWS_ClientDisconnectCancelsSubscription(t *testing.T) {
-	events := make(chan *Tick, 10)
-	defer close(events)
-
-	parsed := graphql.MustParseSchema(subSDL, &subResolver{events: events})
+	res := &subResolver{}
+	parsed := graphql.MustParseSchema(subSDL, res)
 
 	server := httptest.NewServer(handlers.NewWebSocket(parsed))
 	defer server.Close()
@@ -317,7 +353,6 @@ func TestWS_ClientDisconnectCancelsSubscription(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 
-	// Init + start subscription
 	init, _ := json.Marshal(map[string]string{"type": "connection_init"})
 	_ = conn.WriteMessage(websocket.TextMessage, init)
 
@@ -334,13 +369,12 @@ func TestWS_ClientDisconnectCancelsSubscription(t *testing.T) {
 	})
 	_ = conn.WriteMessage(websocket.TextMessage, start)
 
-	// Disconnect abruptly
+	waitForSubscribers(t, res, 1)
+
 	conn.Close()
 
-	// Give server time to process
 	time.Sleep(200 * time.Millisecond)
 
-	// Server should have cleaned up — sending on events should not panic
-	// (This is a bit indirect, but verifies no goroutine leaks crash the server)
-	events <- &Tick{IDValue: 1}
+	// Server should have cleaned up; publishing must not panic.
+	res.publish(t, &Tick{IDValue: 1})
 }
